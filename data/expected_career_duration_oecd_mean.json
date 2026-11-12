@@ -1,0 +1,16 @@
+{
+  "data": "expected_career_duration_oecd_mean.csv",
+  "geometry": "natural-earth",
+  "value": "Total",
+  "title": "Expected lifetime career duration, years",
+  "subtitle": "Taking effective retirement age, start of career, unemployment etc. into account",
+  "value_format": "%.1f",
+  "key": {
+    "columns": [
+      {"column": "Men", "format": "%.1f"},
+      {"column": "Women", "format": "%.1f"}
+    ]
+  },
+  "source": "OECD, Pensions at a Glance 2025, Chapter 2, Figure 2.10, \"Expected career duration differs substantially between men and women\"; bovine3dom",
+  "scale": {"method": "quantile", "reverse": false}
+}

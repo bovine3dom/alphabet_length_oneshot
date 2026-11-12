@@ -1,269 +1,390 @@
 #!/usr/bin/env python3
-"""Build a European alphabet-length map from Natural Earth 1:110m polygons."""
+"""Draw a European choropleth from a CSV file and JSON metadata."""
 
+import argparse
 import csv
 import json
+import sys
+import textwrap
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import matplotlib.patheffects as path_effects
+import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.collections import PolyCollection
-from matplotlib.colors import LinearSegmentedColormap, Normalize
-from matplotlib.patches import Rectangle
+from matplotlib.collections import LineCollection, PatchCollection
+from matplotlib.colors import FuncNorm, LinearSegmentedColormap, Normalize
+from matplotlib.font_manager import FontProperties
+from matplotlib.text import Text
+from pyproj import Transformer
+from shapely import orient_polygons, segmentize, transform
+from shapely.geometry import box, shape
+from shapely.plotting import patch_from_polygon
 
-ROOT = Path(__file__).resolve().parent
-DATA = ROOT / "data"
-SOURCE = DATA / "ne_110m_admin_0_countries.geojson"
-CROPPED = DATA / "ne_110m_europe_crop.geojson"
-OUTPUT = ROOT / "europe_alphabet_map.png"
-CSV = ROOT / "alphabet_counts.csv"
+from prepare_geography import BOUNDS, OUTPUT as GEOGRAPHY, ROOT, prepare
+from prepare_cartogram import BOUNDS as CARTOGRAM_BOUNDS, OUTPUT as CARTOGRAM
 
-# D3-scale-chromatic schemeSpectral[11], interpolated continuously.
 SPECTRAL = [
     "#9e0142", "#d53e4f", "#f46d43", "#fdae61", "#fee08b",
     "#ffffbf", "#e6f598", "#abdda4", "#66c2a5", "#3288bd", "#5e4fa2",
 ]
-CMAP = LinearSegmentedColormap.from_list("D3 Spectral", SPECTRAL, N=256)
-
-# name, Natural Earth ADMIN name (None for point-scale countries), ISO-style code,
-# representative language, alphabet entries, map label position (longitude, latitude).
-COUNTRIES = [
-    ("Albania", "Albania", "AL", "Albanian", 36, (19.6, 40.7)),
-    ("Andorra", None, "AD", "Catalan", 35, (2.7, 43.1)),
-    ("Armenia", "Armenia", "AM", "Armenian", 39, (44.4, 39.0)),
-    ("Austria", "Austria", "AT", "German", 30, (14.4, 48.2)),
-    ("Azerbaijan", "Azerbaijan", "AZ", "Azerbaijani", 32, (46.5, 41.3)),
-    ("Belarus", "Belarus", "BY", "Belarusian", 32, (28.1, 53.4)),
-    ("Belgium", "Belgium", "BE", "Dutch", 26, (3.5, 50.5)),
-    ("Bosnia and Herzegovina", "Bosnia and Herzegovina", "BA", "Bosnian", 30, (18.4, 44.0)),
-    ("Bulgaria", "Bulgaria", "BG", "Bulgarian", 30, (25.2, 42.8)),
-    ("Croatia", "Croatia", "HR", "Croatian", 30, (15.8, 45.3)),
-    ("Cyprus", "Cyprus", "CY", "Greek", 33, (33.3, 34.8)),
-    ("Czechia", "Czechia", "CZ", "Czech", 42, (15.6, 50.0)),
-    ("Denmark", "Denmark", "DK", "Danish", 29, (10.1, 56.0)),
-    ("Estonia", "Estonia", "EE", "Estonian", 27, (25.7, 58.9)),
-    ("Finland", "Finland", "FI", "Finnish", 29, (27.4, 63.5)),
-    ("France", "France", "FR", "French", 39, (1.8, 46.3)),
-    ("Georgia", "Georgia", "GE", "Georgian", 33, (41.7, 42.7)),
-    ("Germany", "Germany", "DE", "German", 30, (10.2, 51.3)),
-    ("Greece", "Greece", "GR", "Greek", 33, (23.2, 38.8)),
-    ("Hungary", "Hungary", "HU", "Hungarian", 44, (19.3, 47.0)),
-    ("Iceland", "Iceland", "IS", "Icelandic", 32, (-18.5, 65.1)),
-    ("Ireland", "Ireland", "IE", "English", 26, (-8.0, 53.3)),
-    ("Italy", "Italy", "IT", "Italian", 28, (12.2, 42.7)),
-    ("Kosovo", "Kosovo", "XK", "Albanian", 36, (22.0, 43.1)),
-    ("Latvia", "Latvia", "LV", "Latvian", 33, (24.7, 57.1)),
-    ("Liechtenstein", None, "LI", "German", 30, (9.8, 48.0)),
-    ("Lithuania", "Lithuania", "LT", "Lithuanian", 32, (24.0, 55.2)),
-    ("Luxembourg", "Luxembourg", "LU", "Luxembourgish", 29, (6.2, 49.5)),
-    ("Malta", None, "MT", "Maltese", 30, (15.6, 36.2)),
-    ("Moldova", "Moldova", "MD", "Romanian", 31, (29.0, 47.5)),
-    ("Monaco", None, "MC", "French", 39, (6.3, 44.1)),
-    ("Montenegro", "Montenegro", "ME", "Montenegrin", 32, (18.5, 42.7)),
-    ("Netherlands", "Netherlands", "NL", "Dutch", 26, (5.4, 52.2)),
-    ("North Macedonia", "North Macedonia", "MK", "Macedonian", 31, (22.2, 41.2)),
-    ("Norway", "Norway", "NO", "Norwegian", 29, (13.3, 63.4)),
-    ("Poland", "Poland", "PL", "Polish", 32, (19.2, 52.3)),
-    ("Portugal", "Portugal", "PT", "Portuguese", 38, (-8.2, 39.4)),
-    ("Romania", "Romania", "RO", "Romanian", 31, (25.0, 45.7)),
-    ("Russia", "Russia", "RU", "Russian", 33, (39.5, 59.5)),
-    ("San Marino", None, "SM", "Italian", 28, (13.3, 44.6)),
-    ("Serbia", "Republic of Serbia", "RS", "Serbian", 30, (21.5, 44.5)),
-    ("Slovakia", "Slovakia", "SK", "Slovak", 46, (19.1, 48.7)),
-    ("Slovenia", "Slovenia", "SI", "Slovene", 25, (14.0, 45.8)),
-    ("Spain", "Spain", "ES", "Spanish", 33, (-3.5, 40.4)),
-    ("Sweden", "Sweden", "SE", "Swedish", 29, (17.5, 61.4)),
-    ("Switzerland", "Switzerland", "CH", "German", 30, (7.7, 46.6)),
-    ("Turkey", "Turkey", "TR", "Turkish", 29, (35.0, 39.1)),
-    ("Ukraine", "Ukraine", "UA", "Ukrainian", 33, (31.4, 49.0)),
-    ("United Kingdom", "United Kingdom", "GB", "English", 26, (-2.7, 54.7)),
-    ("Vatican City", None, "VA", "Italian", 28, (13.8, 41.5)),
-]
-
-# Point locations for small states omitted at Natural Earth's 1:110m scale.
-POINTS = {
-    "AD": (1.52, 42.51), "LI": (9.55, 47.17), "MC": (7.42, 43.73),
-    "MT": (14.38, 35.90), "SM": (12.46, 43.94), "VA": (12.45, 41.90),
+CMAP = LinearSegmentedColormap.from_list("Spectral", SPECTRAL, N=4096)
+GEOMETRIES = ("natural-earth", "owid")
+# Small-state point symbols and callouts.
+CALLOUTS = {
+    "AND": ((1.52, 42.51), (2.6, 43.15)),
+    "LIE": ((9.55, 47.17), (9.9, 48.05)),
+    "MCO": ((7.42, 43.73), (6.3, 44.15)),
+    "MLT": ((14.38, 35.90), (15.4, 36.25)),
+    "SMR": ((12.46, 43.94), (13.3, 44.65)),
+    "VAT": ((12.45, 41.90), (13.8, 41.5)),
 }
+BACKGROUND = "#dce3df"
+INK = "#000000"
+MISSING = {"", "NA", "N/A", "NAN", ".."}
+DPI = 120
+FONT_SCALE = 1.7
+SPLEEN = {height: ROOT / f"fonts/spleen/spleen-{width}x{height}.otf"
+          for width, height in ((8, 16), (12, 24), (32, 64))}
 
-# Spherical Lambert conformal conic projection, centered on Europe.
-def project(lon, lat):
-    phi = np.radians(lat)
-    lam = np.radians(lon)
-    phi1, phi2 = np.radians(43.0), np.radians(62.0)
-    phi0, lam0 = np.radians(52.0), np.radians(15.0)
-    n = np.log(np.cos(phi1) / np.cos(phi2)) / np.log(
-        np.tan(np.pi / 4 + phi2 / 2) / np.tan(np.pi / 4 + phi1 / 2)
+
+def country_aliases(countries):
+    aliases = {country["ADM0_A3"]: country["ADM0_A3"] for country in countries}
+    for country in countries:
+        # Overseas features can share ISO codes with their parent country (e.g. France).
+        canonical = aliases.get(country["ISO_A3_EH"], country["ADM0_A3"])
+        for field in ("ISO_A2_EH", "ISO_A3_EH"):
+            code = country[field]
+            if code and code != "-99":
+                aliases[code] = canonical
+    aliases.update({"UK": "GBR", "EL": "GRC", "XKX": "KOS"})
+    return aliases
+
+
+def detect_country_column(columns, rows, aliases):
+    scores = {column: sum((row[column] or "").strip().upper() in aliases for row in rows)
+              for column in columns}
+    best = max(scores.values(), default=0)
+    candidates = [column for column, score in scores.items() if score == best and score > 0]
+    if not candidates:
+        raise ValueError("CSV requires a column containing country codes")
+    if len(candidates) > 1:
+        raise ValueError(f"Multiple country-code columns detected: {', '.join(candidates)}")
+    return candidates[0]
+
+
+def load_values(path, metadata, aliases):
+    value_column = metadata.get("value", "value")
+    values, records = {}, {}
+    with path.open(encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        required = {value_column}
+        required.update(column["column"] for column in metadata.get("key", {}).get("columns", []))
+        if not required.issubset(reader.fieldnames or []):
+            raise ValueError(f"CSV requires columns: {sorted(required)}")
+        rows = list(reader)
+        code_column = detect_country_column(
+            [column for column in reader.fieldnames if column != value_column], rows, aliases,
+        )
+        for row_number, row in enumerate(rows, 2):
+            raw_code = (row[code_column] or "").strip().upper()
+            code = aliases.get(raw_code)
+            if code is None:
+                print(f"Warning: skipping unmatched country code {raw_code!r} "
+                      f"at CSV row {row_number} ({code_column}).", file=sys.stderr)
+                continue
+            if code in values:
+                raise ValueError(f"Duplicate country at CSV row {row_number}: {code}")
+            records[code] = row
+            raw = (row[value_column] or "").strip()
+            if raw.upper() in MISSING:
+                values[code] = None
+                continue
+            try:
+                value = float(raw)
+            except ValueError as error:
+                raise ValueError(f"Invalid value at CSV row {row_number}: {raw!r}") from error
+            if not np.isfinite(value):
+                raise ValueError(f"Value must be finite at CSV row {row_number}")
+            values[code] = value
+    return values, records
+
+
+def make_norm(values, scale):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0 or not np.isfinite(values).all():
+        raise ValueError("The map requires at least one finite observation")
+    method = scale.get("method", "linear")
+    if method not in ("linear", "quantile"):
+        raise ValueError("scale.method must be linear or quantile")
+    domain = scale.get("domain")
+    if domain is not None:
+        if method != "linear":
+            raise ValueError("scale.domain applies to the linear scale")
+        domain = np.asarray(domain, dtype=float)
+        if domain.shape != (2,) or not np.isfinite(domain).all() or domain[0] >= domain[1]:
+            raise ValueError("scale.domain requires two finite, increasing values")
+        return Normalize(*domain, clip=True)
+    unique, counts = np.unique(values, return_counts=True)
+    if len(unique) == 1:
+        return Normalize(unique[0] - 0.5, unique[0] + 0.5, clip=True)
+    if method == "linear":
+        return Normalize(unique[0], unique[-1], clip=True)
+    # Interpolate empirical mid-ranks. Ties share a rank; endpoints use the full palette.
+    ranks = np.cumsum(counts) - counts / 2
+    ranks = (ranks - ranks[0]) / (ranks[-1] - ranks[0])
+    return FuncNorm(
+        (lambda x: np.interp(x, unique, ranks), lambda p: np.interp(p, ranks, unique)),
+        vmin=unique[0], vmax=unique[-1], clip=True,
     )
-    f = np.cos(phi1) * np.tan(np.pi / 4 + phi1 / 2) ** n / n
-    rho = f / np.tan(np.pi / 4 + phi / 2) ** n
-    rho0 = f / np.tan(np.pi / 4 + phi0 / 2) ** n
-    theta = n * (lam - lam0)
-    return rho * np.sin(theta), rho0 - rho * np.cos(theta)
 
 
-def polygons(feature):
-    geometry = feature.get("geometry")
-    if not geometry:
-        return
-    coords = geometry["coordinates"]
-    if geometry["type"] == "Polygon":
-        yield coords
-    elif geometry["type"] == "MultiPolygon":
-        yield from coords
+def spectral(scale):
+    reverse = scale.get("reverse", False)
+    if not isinstance(reverse, bool):
+        raise ValueError("scale.reverse must be true or false")
+    return CMAP.reversed() if reverse else CMAP
 
 
-def projected_rings(feature):
-    for polygon in polygons(feature):
-        ring = polygon[0]
-        lon, lat = np.asarray(ring).T
-        x, y = project(lon, lat)
-        yield np.column_stack((x, y))
+def load_map(metadata_path, geometry=None):
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    for field in ("data", "title", "source"):
+        if not metadata.get(field):
+            raise ValueError(f"Metadata requires {field}")
+    geometry = geometry or metadata.get("geometry", "natural-earth")
+    if geometry not in GEOMETRIES:
+        raise ValueError(f"geometry must be one of: {', '.join(GEOMETRIES)}")
+    metadata["geometry"] = geometry
+    path = CARTOGRAM if geometry == "owid" else GEOGRAPHY
+    if geometry == "natural-earth" and not path.exists():
+        prepare()
+    geography = json.loads(path.read_text(encoding="utf-8"))
+    aliases = country_aliases(geography["countries"])
+    values, records = load_values(metadata_path.parent / metadata["data"], metadata, aliases)
+    visible = {feature["properties"]["ADM0_A3"] for feature in geography["features"]}
+    # Use geographic anchors for the same European selection in both layouts.
+    visible &= {country["ADM0_A3"] for country in geography["countries"]
+                if BOUNDS[0] <= country["LABEL_X"] <= BOUNDS[2]
+                and BOUNDS[1] <= country["LABEL_Y"] <= BOUNDS[3]}
+    values = {code: value for code, value in values.items() if code in visible and value is not None}
+    norm = make_norm(list(values.values()), metadata.get("scale", {}))
+    return metadata, geography["features"], values, norm, {code: records[code] for code in values}
+
+
+def projection():
+    return Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True).transform
+
+
+def graticule(project):
+    west, south, east, north = BOUNDS
+    for latitude in range(40, north, 10):
+        lon = np.linspace(west, east, 400)
+        yield project(lon, np.full_like(lon, latitude))
+    for longitude in range(-20, east, 10):
+        lat = np.linspace(south, north, 400)
+        yield project(np.full_like(lat, longitude), lat)
+
+
+def polygon_patch(geometry, project):
+    # Densify crop edges before projection; retain interior rings for lakes and enclaves.
+    projected = transform(segmentize(geometry, 0.25), project, interleaved=False)
+    return patch_from_polygon(orient_polygons(projected))
+
+
+def line_segments(geometry):
+    if geometry.geom_type in ("LineString", "LinearRing") and not geometry.is_empty:
+        yield np.asarray(geometry.coords)
+    elif hasattr(geometry, "geoms"):
+        for part in geometry.geoms:
+            yield from line_segments(part)
+
+
+def legend_ticks(norm):
+    lower, upper = np.ceil(norm.vmin), np.floor(norm.vmax)
+    if lower > upper:
+        return np.array([])
+    return np.unique(np.clip(np.rint(norm.inverse(np.linspace(0, 1, 6))), lower, upper))
+
+
+def format_key_value(value, fmt=None):
+    if value is None or str(value).strip().upper() in MISSING:
+        return "—"
+    if fmt:
+        number = float(value)
+        if not np.isfinite(number):
+            raise ValueError(f"Key value must be finite: {value!r}")
+        return fmt.format(x=number) if "{" in fmt else fmt % number
+    return str(value).removesuffix(".0") if isinstance(value, float) else str(value)
+
+
+def apply_typography(figure, font, dpi, scale):
+    for text in figure.findobj(Text):
+        text.set_fontsize(text.get_fontsize() * scale)
+        if font == "spleen":
+            pixels = text.get_fontsize() * dpi / 72
+            height = min(SPLEEN, key=lambda size: abs(size - pixels))
+            text.set_fontproperties(FontProperties(fname=SPLEEN[height], size=height * 72 / dpi))
+            text.set_antialiased(False)
+
+
+def draw_country_key(fig, features, values, norm, cmap, metadata, records):
+    rows = sorted((feature["properties"] for feature in features
+                   if feature["properties"]["ADM0_A3"] in values), key=lambda row: row["ADMIN"])
+    value_column = metadata.get("value", "value")
+    columns = metadata.get("key", {}).get("columns", []) + [
+        {"column": value_column, "format": metadata.get("value_format")}
+    ]
+    ax = fig.add_axes([0.02, 0.10, 0.91, 0.79])
+    ax.set_xlim(0, 4.4 + 0.9 * (len(columns) - 1))
+    ax.set_ylim(0, 1)
+    ax.set_axis_off()
+    ax.text(0.33, 1, "COUNTRY", fontsize=9, weight="bold", color=INK)
+    for index, column in enumerate(columns):
+        ax.text(4.4 + 0.9 * index, 1, column["column"],
+                ha="right", fontsize=9, weight="bold", color=INK)
+    step = 0.92 / len(rows)
+    fontsize = min(9.5, 0.8 * step * ax.bbox.height * 72 / fig.dpi
+                   / metadata.get("font_scale", FONT_SCALE))
+    for index, row in enumerate(rows):
+        y = 0.94 - index * step
+        code = row["ADM0_A3"]
+        if index % 2 == 0:
+            ax.axhspan(y - step / 2, y + step / 2, facecolor="#f4f4f4", edgecolor="none", zorder=-1)
+        ax.scatter(0.11, y, s=28, marker="s", c=[cmap(norm(values[code]))],
+                   edgecolors=INK, linewidths=0.5)
+        cells = [(0.33, row["ISO_A2_EH"], "bold", "left"), (0.792, row["ADMIN"], "normal", "left")]
+        for column_index, column in enumerate(columns):
+            value = records[code][column["column"]]
+            cells.append((4.4 + 0.9 * column_index, format_key_value(value, column.get("format")),
+                          "normal", "right"))
+        for x, text, weight, align in cells:
+            ax.text(x, y, text, va="center", ha=align, fontsize=fontsize, weight=weight, color=INK)
+
+
+def fit_cartogram_pixels(ax, bounds, dpi):
+    """Fit whole display pixels to each cartogram coordinate unit."""
+    factor = dpi / ax.figure.dpi
+    available = np.array(ax.get_position(original=True).transformed(ax.figure.transSubfigure).bounds) * factor
+    span = np.array(bounds[2:]) - bounds[:2]
+    scale = np.floor(min(available[2:] / span))
+    if scale < 1:
+        raise ValueError("Increase dpi to fit at least one pixel per cartogram unit")
+    size = span * scale
+    origin = np.rint(available[:2] + (available[2:] - size) / 2)
+    frame = np.array(ax.figure.bbox.bounds) * factor
+    ax.set_position([*((origin - frame[:2]) / frame[2:]), *(size / frame[2:])])
+
+
+def render(metadata, features, values, norm, output, records):
+    cartogram = metadata.get("geometry", "natural-earth") == "owid"
+    project = (lambda x, y: (x, y)) if cartogram else projection()
+    bounds = CARTOGRAM_BOUNDS if cartogram else BOUNDS
+    cmap = spectral(metadata.get("scale", {}))
+    font = metadata.get("font", "spleen")
+    if font not in ("spleen", "sans"):
+        raise ValueError("font must be spleen or sans")
+    dpi = metadata.get("dpi", DPI)
+    font_scale = metadata.get("font_scale", FONT_SCALE)
+    antialias = False
+    for name, value in (("dpi", dpi), ("font_scale", font_scale)):
+        if type(value) not in (int, float) or not np.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be a positive number")
+    # Reserve a fixed-width map panel and add key columns on the right.
+    key_width = 4.4 + 0.9 * len(metadata.get("key", {}).get("columns", []))
+    figure = plt.figure(figsize=(12.8 + key_width, 10.2), facecolor="#ffffff")
+    fig, key = figure.subfigures(1, 2, width_ratios=[12.8, key_width], wspace=0, facecolor="#ffffff")
+    fig.text(0.05, 0.95, metadata["title"], fontsize=22, weight="bold", color=INK)
+    fig.text(0.05, 0.915, metadata.get("subtitle", ""), fontsize=10, color=INK)
+    ax = fig.add_axes([0.10, 0.10, 0.89, 0.79], aspect="equal")
+    ax.set_axis_off()
+    view = transform(segmentize(box(*bounds), 0.25), project, interleaved=False)
+    ax.add_patch(patch_from_polygon(view, facecolor="#f7f6f1", edgecolor="none",
+                                    antialiased=antialias, zorder=-1))
+    west, south, east, north = view.bounds
+    ax.set_xlim(west, east)
+    ax.set_ylim(south, north)
+    if cartogram:
+        fit_cartogram_pixels(ax, bounds, dpi)
+    if not cartogram:
+        for x, y in graticule(project):
+            ax.plot(x, y, color="#d5e0e1", linewidth=0.5, antialiased=antialias, zorder=0)
+
+    patches, colors, borders = [], [], []
+    for feature in features:
+        code = feature["properties"]["ADM0_A3"]
+        patches.append(polygon_patch(shape(feature["geometry"]), project))
+        colors.append(cmap(norm(values[code])) if code in values else BACKGROUND)
+        boundary = transform(segmentize(shape(feature["boundary"]), 0.25), project, interleaved=False)
+        borders.extend(line_segments(boundary))
+    ax.add_collection(PatchCollection(patches, facecolors=colors, edgecolors="none",
+                                      linewidths=0, antialiased=antialias,
+                                      snap=True if cartogram else None, zorder=2))
+    ax.add_collection(LineCollection(borders, colors="#777777",
+                                     linewidths=2 * 72 / dpi if cartogram else 0.28,
+                                     antialiaseds=antialias, snap=True if cartogram else None,
+                                     capstyle="butt", zorder=3))
+
+    for feature in features:
+        properties = feature["properties"]
+        code = properties["ADM0_A3"]
+        if code not in values:
+            continue
+        lon, lat = properties["LABEL_X"], properties["LABEL_Y"]
+        if not cartogram and code in CALLOUTS:
+            point, (lon, lat) = CALLOUTS[code]
+            x, y = project(*point)
+            tx, ty = project(lon, lat)
+            ax.scatter(x, y, s=28, c=[cmap(norm(values[code]))], edgecolors="white",
+                       linewidths=0.8, antialiaseds=antialias, zorder=6)
+            ax.plot([x, tx], [y, ty], color="#52646a", linewidth=0.55,
+                    antialiased=antialias, zorder=5)
+        if not (bounds[0] <= lon <= bounds[2] and bounds[1] <= lat <= bounds[3]):
+            continue
+        label = ax.text(*project(lon, lat), properties["ISO_A2_EH"], ha="center", va="center",
+                        fontsize=6, weight="bold", color=INK, antialiased=antialias, zorder=7)
+        label.set_path_effects([path_effects.withStroke(linewidth=1, foreground="white",
+                                                       antialiased=antialias)])
+
+    cax = fig.add_axes([0.035, 0.18, 0.018, 0.64])
+    observations = np.asarray(list(values.values()))
+    below, above = observations.min() < norm.vmin, observations.max() > norm.vmax
+    extend = "both" if below and above else "min" if below else "max" if above else "neither"
+    colorbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=cax,
+                            orientation="vertical", ticks=legend_ticks(norm), extend=extend,
+                            format="%.0f")
+    colorbar.outline.set(visible=True, edgecolor=INK, linewidth=0.5)
+    colorbar.ax.tick_params(labelsize=8, length=2, colors=INK, pad=4)
+    fig.text(0.05, 0.058, textwrap.fill(metadata.get("note", ""), 145), fontsize=7, color=INK)
+    attribution = ("Layout: Our World in Data uniform population cartogram (2026)." if cartogram
+                   else "Boundaries: Natural Earth 1:10m")
+    source = f"{metadata['source']}. {attribution}"
+    figure.text(0.05 * 12.8 / (12.8 + key_width), 0.025, source,
+                fontsize=6.5, color=INK, wrap=True)
+    draw_country_key(key, features, values, norm, cmap, metadata, records)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    apply_typography(figure, font, dpi, font_scale)
+    with matplotlib.rc_context({"text.hinting": "none"} if font == "spleen" else {}):
+        figure.savefig(output, dpi=dpi, facecolor=figure.get_facecolor())
+    plt.close(figure)
+    print(f"Wrote {output} ({len(values)} countries; {metadata['geometry']})")
 
 
 def main():
-    if len(COUNTRIES) != 50:
-        raise ValueError(f"Expected 50 countries, found {len(COUNTRIES)}")
-    features = json.loads(CROPPED.read_text(encoding="utf-8"))["features"]
-    by_admin = {f["properties"]["ADMIN"]: f for f in features}
-    missing = [admin for _, admin, _, _, _, _ in COUNTRIES if admin and admin not in by_admin]
-    if missing:
-        raise ValueError(f"Missing Natural Earth countries: {missing}")
-
-    counts = [row[4] for row in COUNTRIES]
-    norm = Normalize(min(counts), max(counts))
-    with CSV.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["country", "code", "representative_language", "alphabet_entries"])
-        writer.writerows((name, code, language, count) for name, _, code, language, count, _ in COUNTRIES)
-
-    fig = plt.figure(figsize=(16.4, 10.0), facecolor="#f7f6f1")
-    fig.text(0.035, 0.955, "EUROPE, LETTER BY LETTER", fontsize=24, weight="bold",
-             color="#152b3c", family="DejaVu Sans")
-    fig.text(0.037, 0.917,
-             "Alphabet length in one principal language per country  ·  50 countries  ·  1:110m geography",
-             fontsize=9.5, color="#4d626b")
-    fig.text(0.965, 0.95, "LANGUAGE ATLAS  /  01", ha="right", fontsize=7,
-             weight="bold", color="#6d7d80")
-
-    ax = fig.add_axes([0.025, 0.12, 0.665, 0.755])
-    ax.set_facecolor("#eaf1f2")
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_axis_off()
-
-    # Subtle graticule for geographic context.
-    for latitude in (40, 50, 60, 70):
-        lon = np.linspace(-28, 48, 240)
-        x, y = project(lon, np.full_like(lon, latitude))
-        ax.plot(x, y, color="#d5e0e1", linewidth=0.5, zorder=0)
-    for longitude in (-20, -10, 0, 10, 20, 30, 40):
-        lat = np.linspace(32, 74, 180)
-        x, y = project(np.full_like(lat, longitude), lat)
-        ax.plot(x, y, color="#d5e0e1", linewidth=0.5, zorder=0)
-
-    background_rings = [
-        ring for feature in features
-        if feature["properties"]["ADMIN"] != "Greenland"
-        for ring in projected_rings(feature)
-    ]
-    ax.add_collection(PolyCollection(
-        background_rings, closed=True, facecolors="#dce3df", edgecolors="#a8b7b8",
-        linewidths=0.36, zorder=1, antialiased=True,
-    ))
-
-    for name, admin, code, language, count, _ in COUNTRIES:
-        if admin is None:
-            continue
-        rings = list(projected_rings(by_admin[admin]))
-        ax.add_collection(PolyCollection(
-            rings, closed=True, facecolors=[CMAP(norm(count))], edgecolors="#ffffff",
-            linewidths=0.7, zorder=2, antialiased=True,
-        ))
-
-    # Fit a projected grid over the clipped European view.
-    grid_lon, grid_lat = np.meshgrid(np.linspace(-28, 48, 120), np.linspace(32, 74, 100))
-    gx, gy = project(grid_lon, grid_lat)
-    ax.set_xlim(gx.min(), gx.max())
-    ax.set_ylim(gy.min(), gy.max())
-
-    # Short country identifiers link the map to the language/count key.
-    label_offsets = {
-        "AL": (-0.2, -0.25), "BA": (0.45, -0.1), "BE": (-0.2, -0.35),
-        "CZ": (0.15, 0.25), "HU": (-0.2, -0.1), "LU": (0.45, -0.1),
-        "ME": (-0.25, 0.25), "MK": (0.7, -0.25), "NL": (0.25, 0.15),
-        "RS": (0.45, 0.2), "SI": (-0.4, -0.2), "SK": (0.35, 0.2),
-        "XK": (0.75, 0.2), "AZ": (0.25, 0.25), "GE": (-0.3, 0.4),
-        "AM": (0.0, -0.3),
-    }
-    for name, admin, code, language, count, anchor in COUNTRIES:
-        if code in POINTS:
-            continue
-        lon, lat = anchor
-        dx, dy = label_offsets.get(code, (0.0, 0.0))
-        x, y = project(lon + dx, lat + dy)
-        label = ax.text(x, y, code, ha="center", va="center", fontsize=6.2,
-                        weight="bold", color="#172d3c", zorder=5)
-        label.set_path_effects([path_effects.withStroke(linewidth=2.0, foreground="#ffffff")])
-
-    # Point symbols identify states that Natural Earth's low-resolution polygons omit.
-    point_labels = {
-        "AD": (2.6, 43.15), "LI": (9.9, 48.05), "MC": (6.3, 44.15),
-        "MT": (15.4, 36.25), "SM": (13.3, 44.65), "VA": (13.8, 41.5),
-    }
-    for name, admin, code, language, count, _ in COUNTRIES:
-        if code not in POINTS:
-            continue
-        lon, lat = POINTS[code]
-        x, y = project(lon, lat)
-        ax.scatter([x], [y], s=30, marker="o", c=[CMAP(norm(count))],
-                   edgecolors="#ffffff", linewidths=0.8, zorder=6)
-        label_lon, label_lat = point_labels[code]
-        tx, ty = project(label_lon, label_lat)
-        ax.plot([x, tx], [y, ty], color="#52646a", linewidth=0.55, zorder=5)
-        label = ax.text(tx, ty, code, ha="center", va="center", fontsize=6.2,
-                        weight="bold", color="#172d3c", zorder=7)
-        label.set_path_effects([path_effects.withStroke(linewidth=2.0, foreground="#ffffff")])
-
-    # Country/language key with a color swatch for every mapped value.
-    panel = Rectangle((0.713, 0.105), 0.275, 0.785, transform=fig.transFigure,
-                      facecolor="#f0f0e9", edgecolor="#d9ded8", linewidth=0.8, zorder=0)
-    fig.add_artist(panel)
-    fig.text(0.728, 0.858, "COUNTRY  /  LANGUAGE", fontsize=8, weight="bold", color="#304953")
-    fig.text(0.728, 0.836, "Code · representative language · alphabet entries", fontsize=6.8, color="#718087")
-    left_x, right_x = 0.729, 0.86
-    columns = (COUNTRIES[:25], COUNTRIES[25:])
-    for col, column in enumerate(columns):
-        x0 = (left_x, right_x)[col]
-        for i, (name, _, code, language, count, _) in enumerate(column):
-            y = 0.805 - i * 0.0277
-            fig.add_artist(Rectangle((x0, y - 0.004), 0.0065, 0.014,
-                                     transform=fig.transFigure, facecolor=CMAP(norm(count)),
-                                     edgecolor="none", zorder=2))
-            short_name = name.replace("Bosnia and Herzegovina", "Bosnia & Herzegovina")
-            label = f"{code}  {short_name} · {language} · {count}"
-            fig.text(x0 + 0.009, y, label, fontsize=5.45, color="#203640", va="center")
-
-    # Continuous legend uses D3's Spectral palette and the observed count range.
-    cax = fig.add_axes([0.075, 0.063, 0.54, 0.016])
-    cb = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=CMAP), cax=cax,
-                      orientation="horizontal", ticks=[25, 30, 35, 40, 46])
-    cb.outline.set_visible(False)
-    cb.ax.tick_params(labelsize=6.5, length=2, colors="#53656d", pad=2)
-    fig.text(0.075, 0.086, "ALPHABET ENTRIES", fontsize=6.5, weight="bold", color="#53656d")
-    fig.text(0.615, 0.071, "D3 SPECTRAL", fontsize=6.5, weight="bold", color="#53656d", ha="right")
-    fig.text(0.035, 0.025,
-             "Source: Natural Earth, 1:110m Admin 0 – Countries (public domain; naturalearthdata.com).  "
-             "Counts are illustrative; common accented forms count separately and established digraphs count once. "
-             "French follows the W-excluded convention. Point markers show states omitted at this map scale.",
-             fontsize=5.35, color="#64747a")
-
-    fig.savefig(OUTPUT, dpi=200, facecolor=fig.get_facecolor(), bbox_inches=None)
-    plt.close(fig)
-    print(f"Wrote {OUTPUT} ({OUTPUT.stat().st_size:,} bytes)")
-    print(f"Wrote {CSV}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("metadata", type=Path, nargs="?",
+                        default=ROOT / "data/expected_career_duration_oecd_mean.json",
+                        help="JSON metadata (default: bundled example)")
+    parser.add_argument("--output", type=Path, help="Output PNG path")
+    parser.add_argument("--geometry", choices=GEOMETRIES, help="Override metadata geometry")
+    args = parser.parse_args()
+    try:
+        metadata, features, values, norm, records = load_map(args.metadata, args.geometry)
+        suffix = "_owid" if metadata["geometry"] == "owid" else ""
+        output = args.output or ROOT / "output" / f"{args.metadata.stem}{suffix}.png"
+        render(metadata, features, values, norm, output, records)
+    except (ValueError, KeyError, OSError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":
